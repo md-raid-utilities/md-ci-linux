@@ -40,10 +40,8 @@ jobs:
       - name: Run a one-line script
         run: echo LOCAL UN THIS XXX!
 
-      - name: Compile
-        run: gcc hello.c
+      - name: Config
+        run: make defconfig
 
-      - name: Runit
-        run: |
-	  make defconfig
-	  make -j 10
+      - name: Compile
+        run: make -j 10
