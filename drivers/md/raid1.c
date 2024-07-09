@@ -2118,6 +2118,7 @@ static int fix_sync_read_error(struct r1bio *r1_bio)
 	struct r1conf *conf = mddev->private;
 	struct bio *bio = r1_bio->bios[r1_bio->read_disk];
 	struct page **pages = get_resync_pages(bio)->pages;
+	===> these pages belong to the bio on "read_disk"
 	sector_t sect = r1_bio->sector;
 	int sectors = r1_bio->sectors;
 	int idx = 0;
@@ -2152,6 +2153,7 @@ static int fix_sync_read_error(struct r1bio *r1_bio)
 				rdev = conf->mirrors[d].rdev;
 				if (sync_page_io(rdev, sect, s<<9,
 						 pages[idx],
+						 ===> we are reading into pages of "read_disk"
 						 REQ_OP_READ, false)) {
 					success = 1;
 					break;
@@ -2205,6 +2207,7 @@ static int fix_sync_read_error(struct r1bio *r1_bio)
 			rdev = conf->mirrors[d].rdev;
 			if (r1_sync_page_io(rdev, sect, s,
 					    pages[idx],
+					    ===> we are writing pages from "read_disk"
 					    REQ_OP_WRITE) == 0) {
 				r1_bio->bios[d]->bi_end_io = NULL;
 				rdev_dec_pending(rdev, mddev);
@@ -2220,6 +2223,7 @@ static int fix_sync_read_error(struct r1bio *r1_bio)
 			rdev = conf->mirrors[d].rdev;
 			if (r1_sync_page_io(rdev, sect, s,
 					    pages[idx],
+					    ===> we are reading into pages of "read_disk"
 					    REQ_OP_READ) != 0)
 				atomic_add(s, &rdev->corrected_errors);
 		}
@@ -2229,6 +2233,7 @@ static int fix_sync_read_error(struct r1bio *r1_bio)
 	}
 	set_bit(R1BIO_Uptodate, &r1_bio->state);
 	bio->bi_status = 0;
+	==> This bio belongs to "read_disk", but the appropriate rdev might have failed to "fix" the error
 	return 1;
 }
 
