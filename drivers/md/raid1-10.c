@@ -252,6 +252,10 @@ static inline int raid1_check_read_range(struct md_rdev *rdev,
 	sector_t first_bad;
 	int bad_sectors;
 
+	if (!test_bit(In_sync, &rdev->flags) &&
+	    rdev->recovery_offset < this_sector + *len)
+		return 0;
+
 	/* no bad block overlap */
 	if (!is_badblock(rdev, this_sector, *len, &first_bad, &bad_sectors))
 		return *len;
