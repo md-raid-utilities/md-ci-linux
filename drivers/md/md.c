@@ -9832,10 +9832,12 @@ int rdev_set_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
 		/* Make sure they get written out promptly */
 		if (test_bit(ExternalBbl, &rdev->flags))
 			sysfs_notify_dirent_safe(rdev->sysfs_unack_badblocks);
-		sysfs_notify_dirent_safe(rdev->sysfs_state);
 		set_mask_bits(&mddev->sb_flags, 0,
 			      BIT(MD_SB_CHANGE_CLEAN) | BIT(MD_SB_CHANGE_PENDING));
 		md_wakeup_thread(rdev->mddev->thread);
+
+		sysfs_notify_dirent_safe(rdev->sysfs_state);
+		sysfs_notify_dirent_safe(mddev->sysfs_state);
 		return 1;
 	} else
 		return 0;
