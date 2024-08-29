@@ -12,7 +12,7 @@ env:
     
 jobs:
   per-patch-testing:
-    runs-on: inspur6-all
+    runs-on: self-hosted
     steps:
       - name: VM startup from snapshot
         run: |
