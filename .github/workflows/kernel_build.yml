@@ -4,7 +4,7 @@ name: mdci-per-patch
 on:
   pull_request:
   push:
-    branches: [ "md-6.12_base" ]
+    branches: [ "md-6.11_base" ]
 
 env:
     MAX_VAG_RETRIES: "3"
