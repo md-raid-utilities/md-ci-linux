@@ -2,6 +2,8 @@ name: md-ci
 
 on:
   pull_request:
+  push:
+    branches: [ "md-6.11_base" ]
 
 jobs:
   build-kernel:
