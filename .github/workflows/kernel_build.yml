@@ -12,6 +12,7 @@ jobs:
           git config --global --add safe.directory '*'
       - name: Checkout git
         run: |
+          echo "Current working directory: ${{ github.workspace }}"
           sudo apt-get install -y libelf-dev
           mkdir -p linux
           cd linux
