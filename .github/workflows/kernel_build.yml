@@ -123,6 +123,7 @@ jobs:
             echo "Version check passed!"
           else
             echo "Kernel install failed"
+          fi  
           vagrant status
           echo "FYI vagrant up command finished with exit code: $?"
           sleep 2
