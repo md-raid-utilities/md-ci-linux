@@ -25,10 +25,12 @@ struct linear_conf {
 	struct dev_info         disks[] __counted_by(raid_disks);
 };
 
+static int prefer_linear_dev_search;
+
 /*
  * find which device holds a particular offset
  */
-static inline struct dev_info *which_dev(struct mddev *mddev, sector_t sector)
+static inline struct dev_info *__which_dev(struct mddev *mddev, sector_t sector)
 {
 	int lo, mid, hi;
 	struct linear_conf *conf;
@@ -52,6 +54,34 @@ static inline struct dev_info *which_dev(struct mddev *mddev, sector_t sector)
 
 	return conf->disks + lo;
 }
+
+/*
+ * If conf->disk[] can be hold within a L1 cache line,
+ * linear search is fater than binary search.
+ */
+static inline struct dev_info *which_dev(struct mddev *mddev, sector_t sector)
+{
+	int i;
+
+	if (prefer_linear_dev_search) {
+		struct linear_conf *conf;
+		struct dev_info *dev;
+		int max;
+
+		conf = mddev->private;
+		dev = conf->disks;
+		max = conf->raid_disks;
+		for (i = 0; i < max; i++, dev++) {
+			if (sector < dev->end_sector)
+				return dev;
+		}
+		return &conf->disks[max-1];
+	}
+
+	/* slow path */
+	return __which_dev(mddev, sector);
+}
+
 
 static sector_t linear_size(struct mddev *mddev, sector_t sectors, int raid_disks)
 {
@@ -220,6 +250,18 @@ static int linear_add(struct mddev *mddev, struct md_rdev *rdev)
 	md_set_array_sectors(mddev, linear_size(mddev, 0, 0));
 	set_capacity_and_notify(mddev->gendisk, mddev->array_sectors);
 	kfree_rcu(oldconf, rcu);
+
+	/*
+	 * When elements in linear_conf->disks[] becomes large enough,
+	 * set prefer_linear_dev_search as 0 to indicate linear search
+	 * in which_dev() is not optimized. Slow path in __which_dev()
+	 * might be faster.
+	 */
+	if ((mddev->raid_disks * sizeof(struct dev_info)) >
+	     cache_line_size() &&
+	    prefer_linear_dev_search == 1)
+		prefer_linear_dev_search = 0;
+
 	return 0;
 }
 
@@ -335,6 +377,7 @@ static struct md_personality linear_personality = {
 
 static int __init linear_init(void)
 {
+	prefer_linear_dev_search = 1;
 	return register_md_personality(&linear_personality);
 }
 
