@@ -3738,6 +3738,27 @@ handle_failed_sync(struct r5conf *conf, struct stripe_head *sh,
 	md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), !abort);
 }
 
+static void
+handle_failed_reshape(struct r5conf *conf, struct stripe_head *sh,
+		      struct stripe_head_state *s)
+{
+	// Abort the current stripe
+	clear_bit(STRIPE_EXPANDING, &sh->state);
+	clear_bit(STRIPE_EXPAND_READY, &sh->state);
+	pr_err("md/raid:%s: read error during reshape at %lu, cannot progress",
+	       mdname(conf->mddev),
+	       (unsigned long)sh->sector);
+	// Freeze the reshape
+	set_bit(MD_RECOVERY_FROZEN, &conf->mddev->recovery);
+	// Revert progress to safe position
+	spin_lock_irq(&conf->device_lock);
+	conf->reshape_progress = conf->reshape_safe;
+	spin_unlock_irq(&conf->device_lock);
+	// report failed md sync
+	md_done_sync(conf->mddev, 0, 0);
+	wake_up(&conf->wait_for_reshape);
+}
+
 static int want_replace(struct stripe_head *sh, int disk_idx)
 {
 	struct md_rdev *rdev;
@@ -4987,6 +5008,8 @@ static void handle_stripe(struct stripe_head *sh)
 			handle_failed_stripe(conf, sh, &s, disks);
 		if (s.syncing + s.replacing)
 			handle_failed_sync(conf, sh, &s);
+		if (test_bit(STRIPE_EXPANDING, &sh->state))
+			handle_failed_reshape(conf, sh, &s);
 	}
 
 	/* Now we check to see if any write operations have recently
