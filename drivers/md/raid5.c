@@ -3671,7 +3671,15 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 			       sh->dev[i].sector + RAID5_STRIPE_SECTORS(conf)) {
 				struct bio *nextbi =
 					r5_next_bio(conf, bi, sh->dev[i].sector);
-
+				/* If we recorded bad blocks from the metadata
+				 * on any of the devices then report this to
+				 * userspace in case anyone might suspect
+				 * something more fundamental instead
+				 */
+				if (s->bad_blocks)
+					pr_warn_ratelimited("%s: read encountered block in device bad block list at %lu",
+							    mdname(conf->mddev),
+							    (unsigned long)sh->sector);
 				bio_io_error(bi);
 				bi = nextbi;
 			}
@@ -4703,6 +4711,12 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
 		if (rdev) {
 			is_bad = rdev_has_badblock(rdev, sh->sector,
 						   RAID5_STRIPE_SECTORS(conf));
+			if (is_bad) {
+				s->bad_blocks++;
+				pr_debug("bad blocks encountered dev %i sector %lu %lu",
+					 i, (unsigned long)sh->sector,
+					 RAID5_STRIPE_SECTORS(conf));
+			}
 			if (s->blocked_rdev == NULL) {
 				if (is_bad < 0)
 					set_bit(BlockedBadBlocks, &rdev->flags);
