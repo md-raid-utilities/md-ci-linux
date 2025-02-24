@@ -8451,6 +8451,94 @@ static int check_reshape(struct mddev *mddev)
 				     + mddev->delta_disks));
 }
 
+static int array_has_badblock(struct r5conf *conf)
+{
+	/* Searches for overlapping bad blocks on devices that would result
+	 * in an unreadable condition
+	 */
+	int i, j;
+	/* First see if we even have bad blocks on enough drives to have a
+	 * bad read condition
+	 */
+	int num_badblock_devs = 0;
+
+	for (i = 0; i < conf->raid_disks; i++) {
+		if (rdev_has_badblock(conf->disks[i].rdev,
+				      0, conf->disks[i].rdev->sectors))
+			num_badblock_devs++;
+	}
+	if (num_badblock_devs <= conf->max_degraded) {
+		/* There are not enough devices with bad blocks to pose any
+		 * read problem
+		 */
+		return 0;
+	}
+	pr_debug("%s: running overlapping bad block check",
+		 mdname(conf->mddev));
+	/* Do a more sophisticated check for overlapping regions */
+	for (i = 0; i < conf->raid_disks; i++) {
+		sector_t first_bad;
+		int bad_sectors;
+		sector_t next_check_s = 0;
+		int next_check_sectors = conf->disks[i].rdev->sectors;
+
+		pr_debug("%s: badblock check: %i (s: %lu, sec: %i)",
+			 mdname(conf->mddev), i,
+			 (unsigned long)next_check_s, next_check_sectors);
+		while (is_badblock(conf->disks[i].rdev,
+				   next_check_s, next_check_sectors,
+				   &first_bad,
+				   &bad_sectors) != 0) {
+			/* Align bad blocks to the size of our stripe */
+			sector_t aligned_first_bad = first_bad &
+				~((sector_t)RAID5_STRIPE_SECTORS(conf) - 1);
+			int aligned_bad_sectors =
+				max_t(int, RAID5_STRIPE_SECTORS(conf),
+				      bad_sectors);
+			int this_num_bad = 1;
+
+			pr_debug("%s: found blocks %i %lu -> %i",
+				 mdname(conf->mddev), i,
+				 (unsigned long)aligned_first_bad,
+				 aligned_bad_sectors);
+			for (j = 0; j < conf->raid_disks; j++) {
+				sector_t this_first_bad;
+				int this_bad_sectors;
+
+				if (j == i)
+					continue;
+				if (is_badblock(conf->disks[j].rdev,
+						aligned_first_bad,
+						aligned_bad_sectors,
+						&this_first_bad,
+						&this_bad_sectors)) {
+					this_num_bad++;
+					pr_debug("md/raid:%s: bad block overlap dev %i: %lu %i",
+						 mdname(conf->mddev), j,
+						 (unsigned long)this_first_bad,
+						 this_bad_sectors);
+				}
+			}
+			if (this_num_bad > conf->max_degraded) {
+				pr_debug("md/raid:%s: %i drives with unreadable sector(s) around %lu %i due to bad block list",
+					 mdname(conf->mddev),
+					 this_num_bad,
+					 (unsigned long)first_bad,
+					 bad_sectors);
+				return 1;
+			}
+			next_check_s = first_bad + bad_sectors;
+			next_check_sectors =
+				next_check_sectors - (first_bad + bad_sectors);
+			pr_debug("%s: badblock check: %i (s: %lu, sec: %i)",
+				 mdname(conf->mddev), i,
+				 (unsigned long)next_check_s,
+				 next_check_sectors);
+		}
+	}
+	return 0;
+}
+
 static int raid5_start_reshape(struct mddev *mddev)
 {
 	struct r5conf *conf = mddev->private;
@@ -8496,6 +8584,12 @@ static int raid5_start_reshape(struct mddev *mddev)
 		pr_warn("md/raid:%s: array size must be reduced before number of disks\n",
 			mdname(mddev));
 		return -EINVAL;
+	}
+
+	if (array_has_badblock(conf)) {
+		pr_warn("md/raid:%s: reshape not possible due to bad block list",
+			mdname(mddev));
+		return -EIO;
 	}
 
 	atomic_set(&conf->reshape_stripes, 0);
