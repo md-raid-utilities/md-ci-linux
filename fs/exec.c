@@ -115,66 +115,6 @@ bool path_noexec(const struct path *path)
 	       (path->mnt->mnt_sb->s_iflags & SB_I_NOEXEC);
 }
 
-#ifdef CONFIG_USELIB
-/*
- * Note that a shared library must be both readable and executable due to
- * security reasons.
- *
- * Also note that we take the address to load from the file itself.
- */
-SYSCALL_DEFINE1(uselib, const char __user *, library)
-{
-	struct linux_binfmt *fmt;
-	struct file *file;
-	struct filename *tmp = getname(library);
-	int error = PTR_ERR(tmp);
-	static const struct open_flags uselib_flags = {
-		.open_flag = O_LARGEFILE | O_RDONLY,
-		.acc_mode = MAY_READ | MAY_EXEC,
-		.intent = LOOKUP_OPEN,
-		.lookup_flags = LOOKUP_FOLLOW,
-	};
-
-	if (IS_ERR(tmp))
-		goto out;
-
-	file = do_filp_open(AT_FDCWD, tmp, &uselib_flags);
-	putname(tmp);
-	error = PTR_ERR(file);
-	if (IS_ERR(file))
-		goto out;
-
-	/*
-	 * Check do_open_execat() for an explanation.
-	 */
-	error = -EACCES;
-	if (WARN_ON_ONCE(!S_ISREG(file_inode(file)->i_mode)) ||
-	    path_noexec(&file->f_path))
-		goto exit;
-
-	error = -ENOEXEC;
-
-	read_lock(&binfmt_lock);
-	list_for_each_entry(fmt, &formats, lh) {
-		if (!fmt->load_shlib)
-			continue;
-		if (!try_module_get(fmt->module))
-			continue;
-		read_unlock(&binfmt_lock);
-		error = fmt->load_shlib(file);
-		read_lock(&binfmt_lock);
-		put_binfmt(fmt);
-		if (error != -ENOEXEC)
-			break;
-	}
-	read_unlock(&binfmt_lock);
-exit:
-	fput(file);
-out:
-	return error;
-}
-#endif /* #ifdef CONFIG_USELIB */
-
 #ifdef CONFIG_MMU
 /*
  * The nascent bprm->mm is not visible until exec_mmap() but it can
@@ -205,18 +145,10 @@ static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
 	/*
 	 * Avoid relying on expanding the stack down in GUP (which
 	 * does not work for STACK_GROWSUP anyway), and just do it
-	 * by hand ahead of time.
+	 * ahead of time.
 	 */
-	if (write && pos < vma->vm_start) {
-		mmap_write_lock(mm);
-		ret = expand_downwards(vma, pos);
-		if (unlikely(ret < 0)) {
-			mmap_write_unlock(mm);
-			return NULL;
-		}
-		mmap_write_downgrade(mm);
-	} else
-		mmap_read_lock(mm);
+	if (!mmap_read_lock_maybe_expand(mm, vma, pos, write))
+		return NULL;
 
 	/*
 	 * We are doing an exec().  'current' is the process
@@ -763,8 +695,6 @@ int setup_arg_pages(struct linux_binprm *bprm,
 	mm->arg_start = bprm->p;
 #endif
 
-	if (bprm->loader)
-		bprm->loader -= stack_shift;
 	bprm->exec -= stack_shift;
 
 	if (mmap_write_lock_killable(mm))
@@ -892,7 +822,8 @@ static struct file *do_open_execat(int fd, struct filename *name, int flags)
 		.lookup_flags = LOOKUP_FOLLOW,
 	};
 
-	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0)
+	if ((flags &
+	     ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_EXECVE_CHECK)) != 0)
 		return ERR_PTR(-EINVAL);
 	if (flags & AT_SYMLINK_NOFOLLOW)
 		open_exec_flags.lookup_flags &= ~LOOKUP_FOLLOW;
@@ -912,7 +843,7 @@ static struct file *do_open_execat(int fd, struct filename *name, int flags)
 	    path_noexec(&file->f_path))
 		return ERR_PTR(-EACCES);
 
-	err = deny_write_access(file);
+	err = exe_file_deny_write_access(file);
 	if (err)
 		return ERR_PTR(err);
 
@@ -927,7 +858,7 @@ static struct file *do_open_execat(int fd, struct filename *name, int flags)
  * Returns ERR_PTR on failure or allocated struct file on success.
  *
  * As this is a wrapper for the internal do_open_execat(), callers
- * must call allow_write_access() before fput() on release. Also see
+ * must call exe_file_allow_write_access() before fput() on release. Also see
  * do_close_execat().
  */
 struct file *open_exec(const char *name)
@@ -1236,13 +1167,12 @@ int begin_new_exec(struct linux_binprm * bprm)
 	 */
 	bprm->point_of_no_return = true;
 
-	/*
-	 * Make this the only thread in the thread group.
-	 */
+	/* Make this the only thread in the thread group */
 	retval = de_thread(me);
 	if (retval)
 		goto out;
-
+	/* see the comment in check_unsafe_exec() */
+	current->fs->in_exec = 0;
 	/*
 	 * Cancel any io_uring activity across execve
 	 */
@@ -1492,7 +1422,7 @@ static void do_close_execat(struct file *file)
 {
 	if (!file)
 		return;
-	allow_write_access(file);
+	exe_file_allow_write_access(file);
 	fput(file);
 }
 
@@ -1504,6 +1434,8 @@ static void free_bprm(struct linux_binprm *bprm)
 	}
 	free_arg_pages(bprm);
 	if (bprm->cred) {
+		/* in case exec fails before de_thread() succeeds */
+		current->fs->in_exec = 0;
 		mutex_unlock(&current->signal->cred_guard_mutex);
 		abort_creds(bprm->cred);
 	}
@@ -1564,6 +1496,21 @@ static struct linux_binprm *alloc_bprm(int fd, struct filename *filename, int fl
 	}
 	bprm->interp = bprm->filename;
 
+	/*
+	 * At this point, security_file_open() has already been called (with
+	 * __FMODE_EXEC) and access control checks for AT_EXECVE_CHECK will
+	 * stop just after the security_bprm_creds_for_exec() call in
+	 * bprm_execve().  Indeed, the kernel should not try to parse the
+	 * content of the file with exec_binprm() nor change the calling
+	 * thread, which means that the following security functions will not
+	 * be called:
+	 * - security_bprm_check()
+	 * - security_bprm_creds_from_file()
+	 * - security_bprm_committing_creds()
+	 * - security_bprm_committed_creds()
+	 */
+	bprm->is_check = !!(flags & AT_EXECVE_CHECK);
+
 	retval = bprm_mm_init(bprm);
 	if (!retval)
 		return bprm;
@@ -1610,6 +1557,10 @@ static void check_unsafe_exec(struct linux_binprm *bprm)
 	 * suid exec because the differently privileged task
 	 * will be able to manipulate the current directory, etc.
 	 * It would be nice to force an unshare instead...
+	 *
+	 * Otherwise we set fs->in_exec = 1 to deny clone(CLONE_FS)
+	 * from another sub-thread until de_thread() succeeds, this
+	 * state is protected by cred_guard_mutex we hold.
 	 */
 	n_fs = 1;
 	spin_lock(&p->fs->lock);
@@ -1806,7 +1757,7 @@ static int exec_binprm(struct linux_binprm *bprm)
 		bprm->file = bprm->interpreter;
 		bprm->interpreter = NULL;
 
-		allow_write_access(exec);
+		exe_file_allow_write_access(exec);
 		if (unlikely(bprm->have_execfd)) {
 			if (bprm->executable) {
 				fput(exec);
@@ -1845,7 +1796,7 @@ static int bprm_execve(struct linux_binprm *bprm)
 
 	/* Set the unchanging part of bprm->cred */
 	retval = security_bprm_creds_for_exec(bprm);
-	if (retval)
+	if (retval || bprm->is_check)
 		goto out;
 
 	retval = exec_binprm(bprm);
@@ -1853,10 +1804,9 @@ static int bprm_execve(struct linux_binprm *bprm)
 		goto out;
 
 	sched_mm_cid_after_execve(current);
-	/* execve succeeded */
-	current->fs->in_exec = 0;
-	current->in_execve = 0;
 	rseq_execve(current);
+	/* execve succeeded */
+	current->in_execve = 0;
 	user_events_execve(current);
 	acct_update_integrals(current);
 	task_numa_free(current, false);
@@ -1873,7 +1823,7 @@ out:
 		force_fatal_sig(SIGSEGV);
 
 	sched_mm_cid_after_execve(current);
-	current->fs->in_exec = 0;
+	rseq_set_notify_resume(current);
 	current->in_execve = 0;
 
 	return retval;
@@ -2151,7 +2101,7 @@ static int proc_dointvec_minmax_coredump(const struct ctl_table *table, int writ
 	return error;
 }
 
-static struct ctl_table fs_exec_sysctls[] = {
+static const struct ctl_table fs_exec_sysctls[] = {
 	{
 		.procname	= "suid_dumpable",
 		.data		= &suid_dumpable,

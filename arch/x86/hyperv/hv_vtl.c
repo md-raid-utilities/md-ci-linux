@@ -11,7 +11,9 @@
 #include <asm/desc.h>
 #include <asm/i8259.h>
 #include <asm/mshyperv.h>
+#include <asm/msr.h>
 #include <asm/realmode.h>
+#include <asm/reboot.h>
 #include <../kernel/smpboot.h>
 
 extern struct boot_params boot_params;
@@ -22,6 +24,36 @@ static bool __init hv_vtl_msi_ext_dest_id(void)
 	return true;
 }
 
+/*
+ * The `native_machine_emergency_restart` function from `reboot.c` writes
+ * to the physical address 0x472 to indicate the type of reboot for the
+ * firmware. We cannot have that in VSM as the memory composition might
+ * be more generic, and such write effectively corrupts the memory thus
+ * making diagnostics harder at the very least.
+ */
+static void  __noreturn hv_vtl_emergency_restart(void)
+{
+	/*
+	 * Cause a triple fault and the immediate reset. Here the code does not run
+	 * on the top of any firmware, whereby cannot reach out to its services.
+	 * The inifinite loop is for the improbable case that the triple fault does
+	 * not work and have to preserve the state intact for debugging.
+	 */
+	for (;;) {
+		idt_invalidate();
+		__asm__ __volatile__("int3");
+	}
+}
+
+/*
+ * The only way to restart in the VTL mode is to triple fault as the kernel runs
+ * as firmware.
+ */
+static void  __noreturn hv_vtl_restart(char __maybe_unused *cmd)
+{
+	hv_vtl_emergency_restart();
+}
+
 void __init hv_vtl_init_platform(void)
 {
 	pr_info("Linux runs in Hyper-V Virtual Trust Level\n");
@@ -30,6 +62,7 @@ void __init hv_vtl_init_platform(void)
 	x86_platform.realmode_init = x86_init_noop;
 	x86_init.irqs.pre_vector_init = x86_init_noop;
 	x86_init.timers.timer_init = x86_init_noop;
+	x86_init.resources.probe_roms = x86_init_noop;
 
 	/* Avoid searching for BIOS MP tables */
 	x86_init.mpparse.find_mptable = x86_init_noop;
@@ -117,11 +150,11 @@ static int hv_vtl_bringup_vcpu(u32 target_vp_index, int cpu, u64 eip_ignored)
 	input->vp_context.rip = rip;
 	input->vp_context.rsp = rsp;
 	input->vp_context.rflags = 0x0000000000000002;
-	input->vp_context.efer = __rdmsr(MSR_EFER);
+	input->vp_context.efer = native_rdmsrq(MSR_EFER);
 	input->vp_context.cr0 = native_read_cr0();
 	input->vp_context.cr3 = __native_read_cr3();
 	input->vp_context.cr4 = native_read_cr4();
-	input->vp_context.msr_cr_pat = __rdmsr(MSR_IA32_CR_PAT);
+	input->vp_context.msr_cr_pat = native_rdmsrq(MSR_IA32_CR_PAT);
 	input->vp_context.idtr.limit = idt_ptr.size;
 	input->vp_context.idtr.base = idt_ptr.address;
 	input->vp_context.gdtr.limit = gdt_ptr.size;
@@ -189,7 +222,7 @@ static int hv_vtl_apicid_to_vp_id(u32 apic_id)
 	input->partition_id = HV_PARTITION_ID_SELF;
 	input->apic_ids[0] = apic_id;
 
-	output = (u32 *)input;
+	output = *this_cpu_ptr(hyperv_pcpu_output_arg);
 
 	control = HV_HYPERCALL_REP_COMP_1 | HVCALL_GET_VP_ID_FROM_APIC_ID;
 	status = hv_do_hypercall(control, input, output);
@@ -235,6 +268,9 @@ static int hv_vtl_wakeup_secondary_cpu(u32 apicid, unsigned long start_eip)
 
 int __init hv_vtl_early_init(void)
 {
+	machine_ops.emergency_restart = hv_vtl_emergency_restart;
+	machine_ops.restart = hv_vtl_restart;
+
 	/*
 	 * `boot_cpu_has` returns the runtime feature support,
 	 * and here is the earliest it can be used.

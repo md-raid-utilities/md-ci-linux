@@ -113,6 +113,7 @@ int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from);
 
 int cgroup_add_dfl_cftypes(struct cgroup_subsys *ss, struct cftype *cfts);
 int cgroup_add_legacy_cftypes(struct cgroup_subsys *ss, struct cftype *cfts);
+int cgroup_add_cftypes(struct cgroup_subsys *ss, struct cftype *cfts);
 int cgroup_rm_cftypes(struct cftype *cfts);
 void cgroup_file_notify(struct cgroup_file *cfile);
 void cgroup_file_show(struct cgroup_file *cfile, bool show);
@@ -343,7 +344,7 @@ static inline u64 cgroup_id(const struct cgroup *cgrp)
  */
 static inline bool css_is_dying(struct cgroup_subsys_state *css)
 {
-	return !(css->flags & CSS_NO_REF) && percpu_ref_is_dying(&css->refcnt);
+	return css->flags & CSS_DYING;
 }
 
 static inline void cgroup_get(struct cgroup *cgrp)
@@ -689,8 +690,6 @@ static inline void cgroup_path_from_kernfs_id(u64 id, char *buf, size_t buflen)
  */
 void cgroup_rstat_updated(struct cgroup *cgrp, int cpu);
 void cgroup_rstat_flush(struct cgroup *cgrp);
-void cgroup_rstat_flush_hold(struct cgroup *cgrp);
-void cgroup_rstat_flush_release(struct cgroup *cgrp);
 
 /*
  * Basic resource stats.
@@ -786,6 +785,17 @@ struct cgroup_namespace *copy_cgroup_ns(unsigned long flags,
 int cgroup_path_ns(struct cgroup *cgrp, char *buf, size_t buflen,
 		   struct cgroup_namespace *ns);
 
+static inline void get_cgroup_ns(struct cgroup_namespace *ns)
+{
+	refcount_inc(&ns->ns.count);
+}
+
+static inline void put_cgroup_ns(struct cgroup_namespace *ns)
+{
+	if (refcount_dec_and_test(&ns->ns.count))
+		free_cgroup_ns(ns);
+}
+
 #else /* !CONFIG_CGROUPS */
 
 static inline void free_cgroup_ns(struct cgroup_namespace *ns) { }
@@ -796,19 +806,10 @@ copy_cgroup_ns(unsigned long flags, struct user_namespace *user_ns,
 	return old_ns;
 }
 
+static inline void get_cgroup_ns(struct cgroup_namespace *ns) { }
+static inline void put_cgroup_ns(struct cgroup_namespace *ns) { }
+
 #endif /* !CONFIG_CGROUPS */
-
-static inline void get_cgroup_ns(struct cgroup_namespace *ns)
-{
-	if (ns)
-		refcount_inc(&ns->ns.count);
-}
-
-static inline void put_cgroup_ns(struct cgroup_namespace *ns)
-{
-	if (ns && refcount_dec_and_test(&ns->ns.count))
-		free_cgroup_ns(ns);
-}
 
 #ifdef CONFIG_CGROUPS
 

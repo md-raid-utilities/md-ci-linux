@@ -15,7 +15,7 @@
 		     cachemode2protval(_PAGE_CACHE_MODE_UC_MINUS)))	\
 	 : (prot))
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 #include <linux/spinlock.h>
 #include <asm/x86_init.h>
 #include <asm/pkru.h>
@@ -290,13 +290,6 @@ static inline unsigned long p4d_pfn(p4d_t p4d)
 static inline unsigned long pgd_pfn(pgd_t pgd)
 {
 	return (pgd_val(pgd) & PTE_PFN_MASK) >> PAGE_SHIFT;
-}
-
-#define p4d_leaf p4d_leaf
-static inline bool p4d_leaf(p4d_t p4d)
-{
-	/* No 512 GiB pages yet */
-	return 0;
 }
 
 #define pte_page(pte)	pfn_to_page(pte_pfn(pte))
@@ -973,7 +966,7 @@ static inline pgd_t pti_set_user_pgtbl(pgd_t *pgdp, pgd_t pgd)
 }
 #endif  /* CONFIG_MITIGATION_PAGE_TABLE_ISOLATION */
 
-#endif	/* __ASSEMBLY__ */
+#endif	/* __ASSEMBLER__ */
 
 
 #ifdef CONFIG_X86_32
@@ -982,7 +975,7 @@ static inline pgd_t pti_set_user_pgtbl(pgd_t *pgdp, pgd_t pgd)
 # include <asm/pgtable_64.h>
 #endif
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 #include <linux/mm_types.h>
 #include <linux/mmdebug.h>
 #include <linux/log2.h>
@@ -1233,12 +1226,12 @@ static inline int pgd_none(pgd_t pgd)
 }
 #endif	/* CONFIG_PGTABLE_LEVELS > 4 */
 
-#endif	/* __ASSEMBLY__ */
+#endif	/* __ASSEMBLER__ */
 
 #define KERNEL_PGD_BOUNDARY	pgd_index(PAGE_OFFSET)
 #define KERNEL_PGD_PTRS		(PTRS_PER_PGD - KERNEL_PGD_BOUNDARY)
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 
 extern int direct_gbpages;
 void init_mem_mapping(void);
@@ -1471,9 +1464,6 @@ static inline bool pgdp_maps_userspace(void *__ptr)
 
 	return (((ptr & ~PAGE_MASK) / sizeof(pgd_t)) < PGD_KERNEL_START);
 }
-
-#define pgd_leaf	pgd_leaf
-static inline bool pgd_leaf(pgd_t pgd) { return false; }
 
 #ifdef CONFIG_MITIGATION_PAGE_TABLE_ISOLATION
 /*
@@ -1812,6 +1802,6 @@ bool arch_is_platform_page(u64 paddr);
 	WARN_ON_ONCE(pgd_present(*pgdp) && !pgd_same(*pgdp, pgd)); \
 	set_pgd(pgdp, pgd); \
 })
-#endif	/* __ASSEMBLY__ */
+#endif	/* __ASSEMBLER__ */
 
 #endif /* _ASM_X86_PGTABLE_H */

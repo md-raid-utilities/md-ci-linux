@@ -51,12 +51,15 @@
 #include <linux/notifier.h>
 #include <linux/cpu.h>
 #include <linux/moduleparam.h>
-#include <asm/cpuid.h>
+#include <asm/cpuid/api.h>
 #include <asm/cpu_device_id.h>
 #include <asm/intel-family.h>
 #include <asm/mwait.h>
 #include <asm/spec-ctrl.h>
+#include <asm/msr.h>
+#include <asm/tsc.h>
 #include <asm/fpu/api.h>
+#include <asm/smp.h>
 
 #define INTEL_IDLE_VERSION "0.5.1"
 
@@ -89,7 +92,6 @@ struct idle_cpu {
 	 * Indicate which enable bits to clear here.
 	 */
 	unsigned long auto_demotion_disable_flags;
-	bool byt_auto_demotion_disable_flag;
 	bool disable_promotion_to_c1e;
 	bool use_acpi;
 };
@@ -226,6 +228,15 @@ static __cpuidle int intel_idle_s2idle(struct cpuidle_device *dev,
 	mwait_idle_with_hints(eax, ecx);
 
 	return 0;
+}
+
+static void intel_idle_enter_dead(struct cpuidle_device *dev, int index)
+{
+	struct cpuidle_driver *drv = cpuidle_get_cpu_driver(dev);
+	struct cpuidle_state *state = &drv->states[index];
+	unsigned long eax = flg2MWAIT(state->flags);
+
+	mwait_play_dead(eax);
 }
 
 /*
@@ -1463,13 +1474,11 @@ static const struct idle_cpu idle_cpu_snx __initconst = {
 static const struct idle_cpu idle_cpu_byt __initconst = {
 	.state_table = byt_cstates,
 	.disable_promotion_to_c1e = true,
-	.byt_auto_demotion_disable_flag = true,
 };
 
 static const struct idle_cpu idle_cpu_cht __initconst = {
 	.state_table = cht_cstates,
 	.disable_promotion_to_c1e = true,
-	.byt_auto_demotion_disable_flag = true,
 };
 
 static const struct idle_cpu idle_cpu_ivb __initconst = {
@@ -1695,6 +1704,10 @@ static bool force_use_acpi __read_mostly; /* No effect if no_acpi is set. */
 module_param_named(use_acpi, force_use_acpi, bool, 0444);
 MODULE_PARM_DESC(use_acpi, "Use ACPI _CST for building the idle states list");
 
+static bool no_native __read_mostly; /* No effect if no_acpi is set. */
+module_param_named(no_native, no_native, bool, 0444);
+MODULE_PARM_DESC(no_native, "Ignore cpu specific (native) idle states in lieu of ACPI idle states");
+
 static struct acpi_processor_power acpi_state_table __initdata;
 
 /**
@@ -1799,7 +1812,11 @@ static void __init intel_idle_init_cstates_acpi(struct cpuidle_driver *drv)
 		if (intel_idle_state_needs_timer_stop(state))
 			state->flags |= CPUIDLE_FLAG_TIMER_STOP;
 
+		if (cx->type > ACPI_STATE_C1 && !boot_cpu_has(X86_FEATURE_NONSTOP_TSC))
+			mark_tsc_unstable("TSC halts in idle");
+
 		state->enter = intel_idle;
+		state->enter_dead = intel_idle_enter_dead;
 		state->enter_s2idle = intel_idle_s2idle;
 	}
 }
@@ -1834,6 +1851,11 @@ static bool __init intel_idle_off_by_default(unsigned int flags, u32 mwait_hint)
 	}
 	return true;
 }
+
+static inline bool ignore_native(void)
+{
+	return no_native && !no_acpi;
+}
 #else /* !CONFIG_ACPI_PROCESSOR_CSTATE */
 #define force_use_acpi	(false)
 
@@ -1843,6 +1865,7 @@ static inline bool intel_idle_off_by_default(unsigned int flags, u32 mwait_hint)
 {
 	return false;
 }
+static inline bool ignore_native(void) { return false; }
 #endif /* !CONFIG_ACPI_PROCESSOR_CSTATE */
 
 /**
@@ -1906,35 +1929,35 @@ static void __init bxt_idle_state_table_update(void)
 	unsigned long long msr;
 	unsigned int usec;
 
-	rdmsrl(MSR_PKGC6_IRTL, msr);
+	rdmsrq(MSR_PKGC6_IRTL, msr);
 	usec = irtl_2_usec(msr);
 	if (usec) {
 		bxt_cstates[2].exit_latency = usec;
 		bxt_cstates[2].target_residency = usec;
 	}
 
-	rdmsrl(MSR_PKGC7_IRTL, msr);
+	rdmsrq(MSR_PKGC7_IRTL, msr);
 	usec = irtl_2_usec(msr);
 	if (usec) {
 		bxt_cstates[3].exit_latency = usec;
 		bxt_cstates[3].target_residency = usec;
 	}
 
-	rdmsrl(MSR_PKGC8_IRTL, msr);
+	rdmsrq(MSR_PKGC8_IRTL, msr);
 	usec = irtl_2_usec(msr);
 	if (usec) {
 		bxt_cstates[4].exit_latency = usec;
 		bxt_cstates[4].target_residency = usec;
 	}
 
-	rdmsrl(MSR_PKGC9_IRTL, msr);
+	rdmsrq(MSR_PKGC9_IRTL, msr);
 	usec = irtl_2_usec(msr);
 	if (usec) {
 		bxt_cstates[5].exit_latency = usec;
 		bxt_cstates[5].target_residency = usec;
 	}
 
-	rdmsrl(MSR_PKGC10_IRTL, msr);
+	rdmsrq(MSR_PKGC10_IRTL, msr);
 	usec = irtl_2_usec(msr);
 	if (usec) {
 		bxt_cstates[6].exit_latency = usec;
@@ -1962,7 +1985,7 @@ static void __init sklh_idle_state_table_update(void)
 	if ((mwait_substates & (0xF << 28)) == 0)
 		return;
 
-	rdmsrl(MSR_PKG_CST_CONFIG_CONTROL, msr);
+	rdmsrq(MSR_PKG_CST_CONFIG_CONTROL, msr);
 
 	/* PC10 is not enabled in PKG C-state limit */
 	if ((msr & 0xF) != 8)
@@ -1974,7 +1997,7 @@ static void __init sklh_idle_state_table_update(void)
 	/* if SGX is present */
 	if (ebx & (1 << 2)) {
 
-		rdmsrl(MSR_IA32_FEAT_CTL, msr);
+		rdmsrq(MSR_IA32_FEAT_CTL, msr);
 
 		/* if SGX is enabled */
 		if (msr & (1 << 18))
@@ -1993,7 +2016,7 @@ static void __init skx_idle_state_table_update(void)
 {
 	unsigned long long msr;
 
-	rdmsrl(MSR_PKG_CST_CONFIG_CONTROL, msr);
+	rdmsrq(MSR_PKG_CST_CONFIG_CONTROL, msr);
 
 	/*
 	 * 000b: C0/C1 (no package C-state support)
@@ -2046,13 +2069,22 @@ static void __init spr_idle_state_table_update(void)
 	 * C6. However, if PC6 is disabled, we update the numbers to match
 	 * core C6.
 	 */
-	rdmsrl(MSR_PKG_CST_CONFIG_CONTROL, msr);
+	rdmsrq(MSR_PKG_CST_CONFIG_CONTROL, msr);
 
 	/* Limit value 2 and above allow for PC6. */
 	if ((msr & 0x7) < 2) {
 		spr_cstates[2].exit_latency = 190;
 		spr_cstates[2].target_residency = 600;
 	}
+}
+
+/**
+ * byt_cht_auto_demotion_disable - Disable Bay/Cherry Trail auto-demotion.
+ */
+static void __init byt_cht_auto_demotion_disable(void)
+{
+	wrmsrq(MSR_CC6_DEMOTION_POLICY_CONFIG, 0);
+	wrmsrq(MSR_MC6_DEMOTION_POLICY_CONFIG, 0);
 }
 
 static bool __init intel_idle_verify_cstate(unsigned int mwait_hint)
@@ -2136,6 +2168,10 @@ static void __init intel_idle_init_cstates_icpu(struct cpuidle_driver *drv)
 	case INTEL_ATOM_GRACEMONT:
 		adl_idle_state_table_update();
 		break;
+	case INTEL_ATOM_SILVERMONT:
+	case INTEL_ATOM_AIRMONT:
+		byt_cht_auto_demotion_disable();
+		break;
 	}
 
 	for (cstate = 0; cstate < CPUIDLE_STATE_MAX; ++cstate) {
@@ -2148,6 +2184,9 @@ static void __init intel_idle_init_cstates_icpu(struct cpuidle_driver *drv)
 		if (!cpuidle_state_table[cstate].enter &&
 		    !cpuidle_state_table[cstate].enter_s2idle)
 			break;
+
+		if (!cpuidle_state_table[cstate].enter_dead)
+			cpuidle_state_table[cstate].enter_dead = intel_idle_enter_dead;
 
 		/* If marked as unusable, skip this state. */
 		if (cpuidle_state_table[cstate].flags & CPUIDLE_FLAG_UNUSABLE) {
@@ -2178,11 +2217,6 @@ static void __init intel_idle_init_cstates_icpu(struct cpuidle_driver *drv)
 
 		drv->state_count++;
 	}
-
-	if (icpu->byt_auto_demotion_disable_flag) {
-		wrmsrl(MSR_CC6_DEMOTION_POLICY_CONFIG, 0);
-		wrmsrl(MSR_MC6_DEMOTION_POLICY_CONFIG, 0);
-	}
 }
 
 /**
@@ -2208,27 +2242,27 @@ static void auto_demotion_disable(void)
 {
 	unsigned long long msr_bits;
 
-	rdmsrl(MSR_PKG_CST_CONFIG_CONTROL, msr_bits);
+	rdmsrq(MSR_PKG_CST_CONFIG_CONTROL, msr_bits);
 	msr_bits &= ~auto_demotion_disable_flags;
-	wrmsrl(MSR_PKG_CST_CONFIG_CONTROL, msr_bits);
+	wrmsrq(MSR_PKG_CST_CONFIG_CONTROL, msr_bits);
 }
 
 static void c1e_promotion_enable(void)
 {
 	unsigned long long msr_bits;
 
-	rdmsrl(MSR_IA32_POWER_CTL, msr_bits);
+	rdmsrq(MSR_IA32_POWER_CTL, msr_bits);
 	msr_bits |= 0x2;
-	wrmsrl(MSR_IA32_POWER_CTL, msr_bits);
+	wrmsrq(MSR_IA32_POWER_CTL, msr_bits);
 }
 
 static void c1e_promotion_disable(void)
 {
 	unsigned long long msr_bits;
 
-	rdmsrl(MSR_IA32_POWER_CTL, msr_bits);
+	rdmsrq(MSR_IA32_POWER_CTL, msr_bits);
 	msr_bits &= ~0x2;
-	wrmsrl(MSR_IA32_POWER_CTL, msr_bits);
+	wrmsrq(MSR_IA32_POWER_CTL, msr_bits);
 }
 
 /**
@@ -2328,6 +2362,10 @@ static int __init intel_idle_init(void)
 	pr_debug("MWAIT substates: 0x%x\n", mwait_substates);
 
 	icpu = (const struct idle_cpu *)id->driver_data;
+	if (icpu && ignore_native()) {
+		pr_debug("ignoring native CPU idle states\n");
+		icpu = NULL;
+	}
 	if (icpu) {
 		if (icpu->state_table)
 			cpuidle_state_table = icpu->state_table;

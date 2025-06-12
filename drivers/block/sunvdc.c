@@ -485,7 +485,7 @@ static int __send_request(struct request *req)
 	}
 
 	sg_init_table(sg, port->ring_cookies);
-	nsg = blk_rq_map_sg(req->q, req, sg);
+	nsg = blk_rq_map_sg(req, sg);
 
 	len = 0;
 	for (i = 0; i < nsg; i++)
@@ -918,12 +918,12 @@ struct vdc_check_port_data {
 	char	*type;
 };
 
-static int vdc_device_probed(struct device *dev, void *arg)
+static int vdc_device_probed(struct device *dev, const void *arg)
 {
 	struct vio_dev *vdev = to_vio_dev(dev);
-	struct vdc_check_port_data *port_data;
+	const struct vdc_check_port_data *port_data;
 
-	port_data = (struct vdc_check_port_data *)arg;
+	port_data = (const struct vdc_check_port_data *)arg;
 
 	if ((vdev->dev_no == port_data->dev_no) &&
 	    (!(strcmp((char *)&vdev->type, port_data->type))) &&
@@ -1070,7 +1070,7 @@ static void vdc_port_remove(struct vio_dev *vdev)
 
 		flush_work(&port->ldc_reset_work);
 		cancel_delayed_work_sync(&port->ldc_reset_timer_work);
-		del_timer_sync(&port->vio.timer);
+		timer_delete_sync(&port->vio.timer);
 
 		del_gendisk(port->disk);
 		put_disk(port->disk);
