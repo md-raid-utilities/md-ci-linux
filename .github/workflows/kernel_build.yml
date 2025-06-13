@@ -72,7 +72,11 @@ jobs:
       - name: Configure kernel
         run: |
           cp .github/config.sh .
+<<<<<<< md-6.16_base
           #cd ..
+=======
+          #cd .. replace after teset
+>>>>>>> md-6.16_base
           echo "********************************"
           echo "Prepare minimal kernel config..."
           echo "********************************"
