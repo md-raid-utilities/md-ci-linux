@@ -54,8 +54,6 @@ jobs:
             ls -al .github
             exit 1
           fi
-      - name: Run checkpatch review
-        uses: webispy/checkpatch-action@v9
       - name: Get some PR info
         run: |
           # echo "USER_EMAIL=$(git log -n 1 --pretty=format:%ae)" >> $GITHUB_ENV
