@@ -7730,6 +7730,7 @@ static int raid5_set_limits(struct mddev *mddev)
 	lim.io_min = mddev->chunk_sectors << 9;
 	lim.io_opt = lim.io_min * (conf->raid_disks - conf->max_degraded);
 	lim.features |= BLK_FEAT_RAID_PARTIAL_STRIPES_EXPENSIVE;
+	lim.flags |= BLK_FLAG_STACK_IO_OPT;
 	lim.discard_granularity = stripe;
 	lim.max_write_zeroes_sectors = 0;
 	mddev_stack_rdev_limits(mddev, &lim, 0);
@@ -7758,9 +7759,13 @@ static int raid5_set_limits(struct mddev *mddev)
 
 	/*
 	 * Requests require having a bitmap for each stripe.
-	 * Limit the max sectors based on this.
+	 * Limit the max sectors based on this. And being
+	 * aligned to lim.io_opt for better I/O performance.
 	 */
 	lim.max_hw_sectors = RAID5_MAX_REQ_STRIPES << RAID5_STRIPE_SHIFT(conf);
+	if (lim.max_hw_sectors > lim.io_opt >> SECTOR_SHIFT)
+		lim.max_hw_sectors = rounddown(lim.max_hw_sectors,
+			  lim.io_opt >> SECTOR_SHIFT);
 
 	/* No restrictions on the number of segments in the request */
 	lim.max_segments = USHRT_MAX;
