@@ -1748,8 +1748,12 @@ static void raid1_status(struct seq_file *seq, struct mddev *mddev)
  *	- recovery is interrupted.
  *	- &mddev->degraded is bumped.
  *
- * @rdev is marked as &Faulty excluding case when array is failed and
- * &mddev->fail_last_dev is off.
+ * If @rdev is marked with &FailfastIOFailure, it means that super_write
+ * failed in failfast and will be retried, so the @mddev did not fail.
+ *
+ * @rdev is marked as &Faulty excluding any cases:
+ *	- when @mddev is failed and &mddev->fail_last_dev is off
+ *	- when @rdev is last device and &FailfastIOFailure flag is set
  */
 static void raid1_error(struct mddev *mddev, struct md_rdev *rdev)
 {
@@ -1760,7 +1764,16 @@ static void raid1_error(struct mddev *mddev, struct md_rdev *rdev)
 
 	if (test_bit(In_sync, &rdev->flags) &&
 	    (conf->raid_disks - mddev->degraded) == 1) {
+		if (test_bit(FailfastIOFailure, &rdev->flags)) {
+			spin_unlock_irqrestore(&conf->device_lock, flags);
+			return;
+		}
+
 		set_bit(MD_BROKEN, &mddev->flags);
+		pr_crit("md/raid1:%s: Disk failure on %pg, this is the last device.\n"
+			"md/raid1:%s: Cannot continue operation (%d/%d failed).\n",
+			mdname(mddev), rdev->bdev,
+			mdname(mddev), mddev->degraded + 1, conf->raid_disks);
 
 		if (!mddev->fail_last_dev) {
 			conf->recovery_disabled = mddev->recovery_disabled;
@@ -1772,6 +1785,11 @@ static void raid1_error(struct mddev *mddev, struct md_rdev *rdev)
 	if (test_and_clear_bit(In_sync, &rdev->flags))
 		mddev->degraded++;
 	set_bit(Faulty, &rdev->flags);
+	if ((conf->raid_disks - mddev->degraded) > 0)
+		pr_crit("md/raid1:%s: Disk failure on %pg, disabling device.\n"
+			"md/raid1:%s: Operation continuing on %d devices.\n",
+			mdname(mddev), rdev->bdev,
+			mdname(mddev), conf->raid_disks - mddev->degraded);
 	spin_unlock_irqrestore(&conf->device_lock, flags);
 	/*
 	 * if recovery is running, make sure it aborts.
@@ -1779,10 +1797,6 @@ static void raid1_error(struct mddev *mddev, struct md_rdev *rdev)
 	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 	set_mask_bits(&mddev->sb_flags, 0,
 		      BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_PENDING));
-	pr_crit("md/raid1:%s: Disk failure on %pg, disabling device.\n"
-		"md/raid1:%s: Operation continuing on %d devices.\n",
-		mdname(mddev), rdev->bdev,
-		mdname(mddev), conf->raid_disks - mddev->degraded);
 }
 
 static void print_conf(struct r1conf *conf)

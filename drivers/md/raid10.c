@@ -1995,8 +1995,12 @@ static int enough(struct r10conf *conf, int ignore)
  *	- recovery is interrupted.
  *	- &mddev->degraded is bumped.
  *
- * @rdev is marked as &Faulty excluding case when array is failed and
- * &mddev->fail_last_dev is off.
+ * If @rdev is marked with &FailfastIOFailure, it means that super_write
+ * failed in failfast, so the @mddev did not fail.
+ *
+ * @rdev is marked as &Faulty excluding any cases:
+ *	- when @mddev is failed and &mddev->fail_last_dev is off
+ *	- when @rdev is last device and &FailfastIOFailure flag is set
  */
 static void raid10_error(struct mddev *mddev, struct md_rdev *rdev)
 {
@@ -2006,7 +2010,16 @@ static void raid10_error(struct mddev *mddev, struct md_rdev *rdev)
 	spin_lock_irqsave(&conf->device_lock, flags);
 
 	if (test_bit(In_sync, &rdev->flags) && !enough(conf, rdev->raid_disk)) {
+		if (test_bit(FailfastIOFailure, &rdev->flags)) {
+			spin_unlock_irqrestore(&conf->device_lock, flags);
+			return;
+		}
+
 		set_bit(MD_BROKEN, &mddev->flags);
+		pr_crit("md/raid10:%s: Disk failure on %pg, this is the last device.\n"
+			"md/raid10:%s: Cannot continue operation (%d/%d failed).\n",
+			mdname(mddev), rdev->bdev,
+			mdname(mddev), mddev->degraded + 1, conf->geo.raid_disks);
 
 		if (!mddev->fail_last_dev) {
 			spin_unlock_irqrestore(&conf->device_lock, flags);
@@ -2021,11 +2034,12 @@ static void raid10_error(struct mddev *mddev, struct md_rdev *rdev)
 	set_bit(Faulty, &rdev->flags);
 	set_mask_bits(&mddev->sb_flags, 0,
 		      BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_PENDING));
+	if (enough(conf, -1))
+		pr_crit("md/raid10:%s: Disk failure on %pg, disabling device.\n"
+			"md/raid10:%s: Operation continuing on %d devices.\n",
+			mdname(mddev), rdev->bdev,
+			mdname(mddev), conf->geo.raid_disks - mddev->degraded);
 	spin_unlock_irqrestore(&conf->device_lock, flags);
-	pr_crit("md/raid10:%s: Disk failure on %pg, disabling device.\n"
-		"md/raid10:%s: Operation continuing on %d devices.\n",
-		mdname(mddev), rdev->bdev,
-		mdname(mddev), conf->geo.raid_disks - mddev->degraded);
 }
 
 static void print_conf(struct r10conf *conf)
