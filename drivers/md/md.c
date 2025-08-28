@@ -986,14 +986,18 @@ static void super_written(struct bio *bio)
 	if (bio->bi_status) {
 		pr_err("md: %s gets error=%d\n", __func__,
 		       blk_status_to_errno(bio->bi_status));
+		if (bio->bi_opf & MD_FAILFAST)
+			set_bit(FailfastIOFailure, &rdev->flags);
 		md_error(mddev, rdev);
 		if (!test_bit(Faulty, &rdev->flags)
 		    && (bio->bi_opf & MD_FAILFAST)) {
+			pr_warn("md: %s: Metadata write will be repeated to %pg\n",
+				mdname(mddev), rdev->bdev);
 			set_bit(MD_SB_NEED_REWRITE, &mddev->sb_flags);
-			set_bit(LastDev, &rdev->flags);
 		}
-	} else
-		clear_bit(LastDev, &rdev->flags);
+	} else {
+		clear_bit(MD_SB_NEED_REWRITE, &mddev->sb_flags);
+	}
 
 	bio_put(bio);
 
@@ -1035,7 +1039,7 @@ void md_super_write(struct mddev *mddev, struct md_rdev *rdev,
 
 	if (test_bit(MD_FAILFAST_SUPPORTED, &mddev->flags) &&
 	    test_bit(FailFast, &rdev->flags) &&
-	    !test_bit(LastDev, &rdev->flags))
+	    !test_bit(MD_SB_NEED_REWRITE, &mddev->sb_flags))
 		bio->bi_opf |= MD_FAILFAST;
 
 	atomic_inc(&mddev->pending_writes);
@@ -1046,7 +1050,7 @@ int md_super_wait(struct mddev *mddev)
 {
 	/* wait for all superblock writes that were scheduled to complete */
 	wait_event(mddev->sb_wait, atomic_read(&mddev->pending_writes)==0);
-	if (test_and_clear_bit(MD_SB_NEED_REWRITE, &mddev->sb_flags))
+	if (test_bit(MD_SB_NEED_REWRITE, &mddev->sb_flags))
 		return -EAGAIN;
 	return 0;
 }

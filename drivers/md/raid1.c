@@ -471,6 +471,7 @@ static void raid1_end_write_request(struct bio *bio)
 		    (bio->bi_opf & MD_FAILFAST) &&
 		    /* We never try FailFast to WriteMostly devices */
 		    !test_bit(WriteMostly, &rdev->flags)) {
+			set_bit(FailfastIOFailure, &rdev->flags);
 			md_error(r1_bio->mddev, rdev);
 		}
 
@@ -1748,8 +1749,12 @@ static void raid1_status(struct seq_file *seq, struct mddev *mddev)
  *	- recovery is interrupted.
  *	- &mddev->degraded is bumped.
  *
- * @rdev is marked as &Faulty excluding case when array is failed and
- * &mddev->fail_last_dev is off.
+ * If @rdev has &FailfastIOFailure and it is the 'last' rdev,
+ * then @mddev and @rdev will not be marked as failed.
+ *
+ * @rdev is marked as &Faulty excluding any cases:
+ *	- when @mddev is failed and &mddev->fail_last_dev is off
+ *	- when @rdev is last device and &FailfastIOFailure flag is set
  */
 static void raid1_error(struct mddev *mddev, struct md_rdev *rdev)
 {
@@ -1760,6 +1765,13 @@ static void raid1_error(struct mddev *mddev, struct md_rdev *rdev)
 
 	if (test_bit(In_sync, &rdev->flags) &&
 	    (conf->raid_disks - mddev->degraded) == 1) {
+		if (test_and_clear_bit(FailfastIOFailure, &rdev->flags)) {
+			spin_unlock_irqrestore(&conf->device_lock, flags);
+			pr_warn_ratelimited("md/raid1:%s: Failfast IO failure on %pg, "
+				"last device but ignoring it\n",
+				mdname(mddev), rdev->bdev);
+			return;
+		}
 		set_bit(MD_BROKEN, &mddev->flags);
 
 		if (!mddev->fail_last_dev) {
@@ -2150,6 +2162,7 @@ static int fix_sync_read_error(struct r1bio *r1_bio)
 	if (test_bit(FailFast, &rdev->flags)) {
 		/* Don't try recovering from here - just fail it
 		 * ... unless it is the last working device of course */
+		set_bit(FailfastIOFailure, &rdev->flags);
 		md_error(mddev, rdev);
 		if (test_bit(Faulty, &rdev->flags))
 			/* Don't try to read from here, but make sure
@@ -2654,6 +2667,7 @@ static void handle_read_error(struct r1conf *conf, struct r1bio *r1_bio)
 		fix_read_error(conf, r1_bio);
 		unfreeze_array(conf);
 	} else if (mddev->ro == 0 && test_bit(FailFast, &rdev->flags)) {
+		set_bit(FailfastIOFailure, &rdev->flags);
 		md_error(mddev, rdev);
 	} else {
 		r1_bio->bios[r1_bio->read_disk] = IO_BLOCKED;
