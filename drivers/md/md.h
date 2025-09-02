@@ -281,9 +281,10 @@ enum flag_bits {
 				 * It is expects that no bad block log
 				 * is present.
 				 */
-	LastDev,		/* Seems to be the last working dev as
-				 * it didn't fail, so don't use FailFast
-				 * any more for metadata
+	FailfastIOFailure,	/* rdev with failfast IO failure
+				 * but md_error not yet completed.
+				 * If the last rdev has this flag,
+				 * error_handler must not fail the array
 				 */
 	CollisionCheck,		/*
 				 * check if there is collision between raid1
@@ -331,8 +332,8 @@ struct md_cluster_operations;
  * @MD_CLUSTER_RESYNC_LOCKED: cluster raid only, which means node, already took
  *			       resync lock, need to release the lock.
  * @MD_FAILFAST_SUPPORTED: Using MD_FAILFAST on metadata writes is supported as
- *			    calls to md_error() will never cause the array to
- *			    become failed.
+ *			    calls to md_error() with FailfastIOFailure will
+ *			    never cause the array to become failed.
  * @MD_HAS_PPL:  The raid array has PPL feature set.
  * @MD_HAS_MULTIPLE_PPLS: The raid array has multiple PPLs feature set.
  * @MD_NOT_READY: do_md_run() is active, so 'array_state', ust not report that
@@ -360,7 +361,7 @@ enum mddev_sb_flags {
 	MD_SB_CHANGE_DEVS,		/* Some device status has changed */
 	MD_SB_CHANGE_CLEAN,	/* transition to or from 'clean' */
 	MD_SB_CHANGE_PENDING,	/* switch from 'clean' to 'active' in progress */
-	MD_SB_NEED_REWRITE,	/* metadata write needs to be repeated */
+	MD_SB_NEED_REWRITE,	/* metadata write needs to be repeated, do not use failfast */
 };
 
 #define NR_SERIAL_INFOS		8
