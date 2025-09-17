@@ -471,7 +471,7 @@ static void raid1_end_write_request(struct bio *bio)
 		    (bio->bi_opf & MD_FAILFAST) &&
 		    /* We never try FailFast to WriteMostly devices */
 		    !test_bit(WriteMostly, &rdev->flags)) {
-			md_error(r1_bio->mddev, rdev);
+			md_bio_failure_error(r1_bio->mddev, rdev, bio);
 		}
 
 		/*
@@ -1736,6 +1736,33 @@ static void raid1_status(struct seq_file *seq, struct mddev *mddev)
 }
 
 /**
+ * update_lastdev - Set or clear LastDev flag for all rdevs in array
+ * @conf: pointer to r1conf
+ *
+ * Sets LastDev if the device is In_sync and cannot be lost for the array.
+ * Otherwise, clear it.
+ *
+ * Caller must hold ->device_lock.
+ */
+static void update_lastdev(struct r1conf *conf)
+{
+	int i;
+	int alive_disks = conf->raid_disks - conf->mddev->degraded;
+
+	for (i = 0; i < conf->raid_disks; i++) {
+		struct md_rdev *rdev = conf->mirrors[i].rdev;
+
+		if (rdev) {
+			if (test_bit(In_sync, &rdev->flags) &&
+			    alive_disks == 1)
+				set_bit(LastDev, &rdev->flags);
+			else
+				clear_bit(LastDev, &rdev->flags);
+		}
+	}
+}
+
+/**
  * raid1_error() - RAID1 error handler.
  * @mddev: affected md device.
  * @rdev: member device to fail.
@@ -1761,6 +1788,10 @@ static void raid1_error(struct mddev *mddev, struct md_rdev *rdev)
 	if (test_bit(In_sync, &rdev->flags) &&
 	    (conf->raid_disks - mddev->degraded) == 1) {
 		set_bit(MD_BROKEN, &mddev->flags);
+		pr_crit("md/raid1:%s: Disk failure on %pg, this is the last device.\n"
+			"md/raid1:%s: Cannot continue operation (%d/%d failed).\n",
+			mdname(mddev), rdev->bdev,
+			mdname(mddev), mddev->degraded + 1, conf->raid_disks);
 
 		if (!mddev->fail_last_dev) {
 			conf->recovery_disabled = mddev->recovery_disabled;
@@ -1769,9 +1800,16 @@ static void raid1_error(struct mddev *mddev, struct md_rdev *rdev)
 		}
 	}
 	set_bit(Blocked, &rdev->flags);
-	if (test_and_clear_bit(In_sync, &rdev->flags))
+	if (test_and_clear_bit(In_sync, &rdev->flags)) {
 		mddev->degraded++;
+		update_lastdev(conf);
+	}
 	set_bit(Faulty, &rdev->flags);
+	if ((conf->raid_disks - mddev->degraded) > 0)
+		pr_crit("md/raid1:%s: Disk failure on %pg, disabling device.\n"
+			"md/raid1:%s: Operation continuing on %d devices.\n",
+			mdname(mddev), rdev->bdev,
+			mdname(mddev), conf->raid_disks - mddev->degraded);
 	spin_unlock_irqrestore(&conf->device_lock, flags);
 	/*
 	 * if recovery is running, make sure it aborts.
@@ -1779,10 +1817,6 @@ static void raid1_error(struct mddev *mddev, struct md_rdev *rdev)
 	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 	set_mask_bits(&mddev->sb_flags, 0,
 		      BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_PENDING));
-	pr_crit("md/raid1:%s: Disk failure on %pg, disabling device.\n"
-		"md/raid1:%s: Operation continuing on %d devices.\n",
-		mdname(mddev), rdev->bdev,
-		mdname(mddev), conf->raid_disks - mddev->degraded);
 }
 
 static void print_conf(struct r1conf *conf)
@@ -1866,6 +1900,7 @@ static int raid1_spare_active(struct mddev *mddev)
 		}
 	}
 	mddev->degraded -= count;
+	update_lastdev(conf);
 	spin_unlock_irqrestore(&conf->device_lock, flags);
 
 	print_conf(conf);
@@ -2150,8 +2185,7 @@ static int fix_sync_read_error(struct r1bio *r1_bio)
 	if (test_bit(FailFast, &rdev->flags)) {
 		/* Don't try recovering from here - just fail it
 		 * ... unless it is the last working device of course */
-		md_error(mddev, rdev);
-		if (test_bit(Faulty, &rdev->flags))
+		if (md_bio_failure_error(mddev, rdev, bio))
 			/* Don't try to read from here, but make sure
 			 * put_buf does it's thing
 			 */
@@ -2490,7 +2524,23 @@ static void fix_read_error(struct r1conf *conf, struct r1bio *r1_bio)
 	}
 }
 
-static bool narrow_write_error(struct r1bio *r1_bio, int i)
+/**
+ * narrow_write_error() - Retry write and set badblock
+ * @r1_bio:	the r1bio containing the write error
+ * @i:		which device to retry
+ * @force:	Retry writing even if badblock is disabled
+ *
+ * Rewrites the bio, splitting it at the least common multiple of the logical
+ * block size and the badblock size. Blocks that fail to be written are marked
+ * as bad. If bbl disabled and @force is not set, no retry is attempted.
+ * If bbl disabled and @force is set, the write is retried in the same way.
+ *
+ * Return:
+ * * %true	- all blocks were written or marked bad successfully
+ * * %false	- bbl disabled or
+ *		  one or more blocks write failed and could not be marked bad
+ */
+static bool narrow_write_error(struct r1bio *r1_bio, int i, bool force)
 {
 	struct mddev *mddev = r1_bio->mddev;
 	struct r1conf *conf = mddev->private;
@@ -2511,13 +2561,17 @@ static bool narrow_write_error(struct r1bio *r1_bio, int i)
 	sector_t sector;
 	int sectors;
 	int sect_to_write = r1_bio->sectors;
-	bool ok = true;
+	bool write_ok = true;
+	bool setbad_ok = true;
+	bool bbl_enabled = !(rdev->badblocks.shift < 0);
 
-	if (rdev->badblocks.shift < 0)
+	if (!force && !bbl_enabled)
 		return false;
 
-	block_sectors = roundup(1 << rdev->badblocks.shift,
-				bdev_logical_block_size(rdev->bdev) >> 9);
+	block_sectors = bdev_logical_block_size(rdev->bdev) >> 9;
+	if (bbl_enabled)
+		block_sectors = roundup(1 << rdev->badblocks.shift,
+					block_sectors);
 	sector = r1_bio->sector;
 	sectors = ((sector + block_sectors)
 		   & ~(sector_t)(block_sectors - 1))
@@ -2545,18 +2599,22 @@ static bool narrow_write_error(struct r1bio *r1_bio, int i)
 		bio_trim(wbio, sector - r1_bio->sector, sectors);
 		wbio->bi_iter.bi_sector += rdev->data_offset;
 
-		if (submit_bio_wait(wbio) < 0)
+		if (submit_bio_wait(wbio) < 0) {
 			/* failure! */
-			ok = rdev_set_badblocks(rdev, sector,
-						sectors, 0)
-				&& ok;
+			write_ok = false;
+			if (bbl_enabled)
+				setbad_ok = rdev_set_badblocks(rdev, sector,
+							       sectors, 0)
+					    && setbad_ok;
+		}
 
 		bio_put(wbio);
 		sect_to_write -= sectors;
 		sector += sectors;
 		sectors = block_sectors;
 	}
-	return ok;
+	return (write_ok ||
+		(bbl_enabled && setbad_ok));
 }
 
 static void handle_sync_write_finished(struct r1conf *conf, struct r1bio *r1_bio)
@@ -2587,26 +2645,36 @@ static void handle_write_finished(struct r1conf *conf, struct r1bio *r1_bio)
 	int m, idx;
 	bool fail = false;
 
-	for (m = 0; m < conf->raid_disks * 2 ; m++)
-		if (r1_bio->bios[m] == IO_MADE_GOOD) {
-			struct md_rdev *rdev = conf->mirrors[m].rdev;
+	for (m = 0; m < conf->raid_disks * 2 ; m++) {
+		struct md_rdev *rdev = conf->mirrors[m].rdev;
+		struct bio *bio = r1_bio->bios[m];
+
+		if (bio == IO_MADE_GOOD) {
 			rdev_clear_badblocks(rdev,
 					     r1_bio->sector,
 					     r1_bio->sectors, 0);
 			rdev_dec_pending(rdev, conf->mddev);
-		} else if (r1_bio->bios[m] != NULL) {
+		} else if (bio != NULL) {
 			/* This drive got a write error.  We need to
 			 * narrow down and record precise write
 			 * errors.
 			 */
 			fail = true;
-			if (!narrow_write_error(r1_bio, m))
-				md_error(conf->mddev,
-					 conf->mirrors[m].rdev);
+			if (!narrow_write_error(
+					r1_bio, m,
+					test_bit(FailFast, &rdev->flags) &&
+					(bio->bi_opf & MD_FAILFAST)))
+				md_error(conf->mddev, rdev);
 				/* an I/O failed, we can't clear the bitmap */
-			rdev_dec_pending(conf->mirrors[m].rdev,
-					 conf->mddev);
+			else if (test_bit(In_sync, &rdev->flags) &&
+				 !test_bit(Faulty, &rdev->flags) &&
+				 rdev_has_badblock(rdev,
+						   r1_bio->sector,
+						   r1_bio->sectors) == 0)
+				set_bit(R1BIO_Uptodate, &r1_bio->state);
+			rdev_dec_pending(rdev, conf->mddev);
 		}
+	}
 	if (fail) {
 		spin_lock_irq(&conf->device_lock);
 		list_add(&r1_bio->retry_list, &conf->bio_end_io_list);
@@ -2629,9 +2697,8 @@ static void handle_write_finished(struct r1conf *conf, struct r1bio *r1_bio)
 static void handle_read_error(struct r1conf *conf, struct r1bio *r1_bio)
 {
 	struct mddev *mddev = conf->mddev;
-	struct bio *bio;
+	struct bio *bio, *updated_bio;
 	struct md_rdev *rdev;
-	sector_t sector;
 
 	clear_bit(R1BIO_ReadError, &r1_bio->state);
 	/* we got a read error. Maybe the drive is bad.  Maybe just
@@ -2644,29 +2711,30 @@ static void handle_read_error(struct r1conf *conf, struct r1bio *r1_bio)
 	 */
 
 	bio = r1_bio->bios[r1_bio->read_disk];
-	bio_put(bio);
-	r1_bio->bios[r1_bio->read_disk] = NULL;
+	updated_bio = NULL;
 
 	rdev = conf->mirrors[r1_bio->read_disk].rdev;
-	if (mddev->ro == 0
-	    && !test_bit(FailFast, &rdev->flags)) {
-		freeze_array(conf, 1);
-		fix_read_error(conf, r1_bio);
-		unfreeze_array(conf);
-	} else if (mddev->ro == 0 && test_bit(FailFast, &rdev->flags)) {
-		md_error(mddev, rdev);
+	if (mddev->ro == 0) {
+		if (!test_bit(FailFast, &rdev->flags)) {
+			freeze_array(conf, 1);
+			fix_read_error(conf, r1_bio);
+			unfreeze_array(conf);
+		} else {
+			md_bio_failure_error(mddev, rdev, bio);
+		}
 	} else {
-		r1_bio->bios[r1_bio->read_disk] = IO_BLOCKED;
+		updated_bio = IO_BLOCKED;
 	}
 
+	bio_put(bio);
+	r1_bio->bios[r1_bio->read_disk] = updated_bio;
+
 	rdev_dec_pending(rdev, conf->mddev);
-	sector = r1_bio->sector;
-	bio = r1_bio->master_bio;
 
 	/* Reuse the old r1_bio so that the IO_BLOCKED settings are preserved */
 	r1_bio->state = 0;
-	raid1_read_request(mddev, bio, r1_bio->sectors, r1_bio);
-	allow_barrier(conf, sector);
+	raid1_read_request(mddev, r1_bio->master_bio, r1_bio->sectors, r1_bio);
+	allow_barrier(conf, r1_bio->sector);
 }
 
 static void raid1d(struct md_thread *thread)
@@ -3298,6 +3366,7 @@ static int raid1_run(struct mddev *mddev)
 	rcu_assign_pointer(conf->thread, NULL);
 	mddev->private = conf;
 	set_bit(MD_FAILFAST_SUPPORTED, &mddev->flags);
+	update_lastdev(conf);
 
 	md_set_array_sectors(mddev, raid1_size(mddev, 0, 0));
 
@@ -3451,6 +3520,7 @@ static int raid1_reshape(struct mddev *mddev)
 
 	spin_lock_irqsave(&conf->device_lock, flags);
 	mddev->degraded += (raid_disks - conf->raid_disks);
+	update_lastdev(conf);
 	spin_unlock_irqrestore(&conf->device_lock, flags);
 	conf->raid_disks = mddev->raid_disks = raid_disks;
 	mddev->delta_disks = 0;

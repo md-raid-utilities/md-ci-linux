@@ -701,6 +701,7 @@ int mddev_init(struct mddev *mddev)
 	atomic_set(&mddev->openers, 0);
 	atomic_set(&mddev->sync_seq, 0);
 	spin_lock_init(&mddev->lock);
+	spin_lock_init(&mddev->error_handle_lock);
 	init_waitqueue_head(&mddev->sb_wait);
 	init_waitqueue_head(&mddev->recovery_wait);
 	mddev->reshape_position = MaxSector;
@@ -986,14 +987,9 @@ static void super_written(struct bio *bio)
 	if (bio->bi_status) {
 		pr_err("md: %s gets error=%d\n", __func__,
 		       blk_status_to_errno(bio->bi_status));
-		md_error(mddev, rdev);
-		if (!test_bit(Faulty, &rdev->flags)
-		    && (bio->bi_opf & MD_FAILFAST)) {
+		if (!md_bio_failure_error(mddev, rdev, bio))
 			set_bit(MD_SB_NEED_REWRITE, &mddev->sb_flags);
-			set_bit(LastDev, &rdev->flags);
-		}
-	} else
-		clear_bit(LastDev, &rdev->flags);
+	}
 
 	bio_put(bio);
 
@@ -8186,7 +8182,7 @@ void md_unregister_thread(struct mddev *mddev, struct md_thread __rcu **threadp)
 }
 EXPORT_SYMBOL(md_unregister_thread);
 
-void md_error(struct mddev *mddev, struct md_rdev *rdev)
+void _md_error(struct mddev *mddev, struct md_rdev *rdev)
 {
 	if (!rdev || test_bit(Faulty, &rdev->flags))
 		return;
@@ -8211,7 +8207,56 @@ void md_error(struct mddev *mddev, struct md_rdev *rdev)
 		queue_work(md_misc_wq, &mddev->event_work);
 	md_new_event();
 }
+
+void md_error(struct mddev *mddev, struct md_rdev *rdev)
+{
+	spin_lock(&mddev->error_handle_lock);
+	_md_error(mddev, rdev);
+	spin_unlock(&mddev->error_handle_lock);
+}
 EXPORT_SYMBOL(md_error);
+
+/** md_bio_failure_error() - md error handler for MD_FAILFAST bios
+ * @mddev: affected md device.
+ * @rdev: member device to fail.
+ * @bio: bio whose triggered device failure.
+ *
+ * This is almost the same as md_error(). That is, it is serialized at
+ * the same level as md_error, marks the rdev as Faulty, and changes
+ * the mddev status.
+ * However, if all of the following conditions are met, it does nothing.
+ * This is because MD_FAILFAST bios must not stopping the array.
+ *  * RAID1 or RAID10
+ *  * LastDev - if rdev becomes Faulty, mddev will stop
+ *  * The failed bio has MD_FAILFAST set
+ *
+ * Returns: true if _md_error() was called, false if not.
+ */
+bool md_bio_failure_error(struct mddev *mddev, struct md_rdev *rdev, struct bio *bio)
+{
+	bool do_md_error = true;
+
+	spin_lock(&mddev->error_handle_lock);
+	if (mddev->pers) {
+		if (mddev->pers->head.id == ID_RAID1 ||
+		    mddev->pers->head.id == ID_RAID10) {
+			if (test_bit(LastDev, &rdev->flags) &&
+			    test_bit(FailFast, &rdev->flags) &&
+			    bio != NULL && (bio->bi_opf & MD_FAILFAST))
+				do_md_error = false;
+		}
+	}
+
+	if (do_md_error)
+		_md_error(mddev, rdev);
+	else
+		pr_warn_ratelimited("md: %s: %s didn't do anything for %pg\n",
+			mdname(mddev), __func__, rdev->bdev);
+
+	spin_unlock(&mddev->error_handle_lock);
+	return do_md_error;
+}
+EXPORT_SYMBOL(md_bio_failure_error);
 
 /* seq_file implementation /proc/mdstat */
 

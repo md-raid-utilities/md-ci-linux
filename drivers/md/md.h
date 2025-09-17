@@ -281,9 +281,10 @@ enum flag_bits {
 				 * It is expects that no bad block log
 				 * is present.
 				 */
-	LastDev,		/* Seems to be the last working dev as
-				 * it didn't fail, so don't use FailFast
-				 * any more for metadata
+	LastDev,		/* This is the last working rdev.
+				 * so don't use FailFast any more for
+				 * metadata and don't Fail rdev
+				 * when FailFast bio failure.
 				 */
 	CollisionCheck,		/*
 				 * check if there is collision between raid1
@@ -619,6 +620,9 @@ struct mddev {
 	/* The sequence number for sync thread */
 	atomic_t sync_seq;
 
+	/* Lock for serializing md_error */
+	spinlock_t			error_handle_lock;
+
 	bool	has_superblocks:1;
 	bool	fail_last_dev:1;
 	bool	serialize_policy:1;
@@ -879,7 +883,9 @@ extern void md_write_start(struct mddev *mddev, struct bio *bi);
 extern void md_write_inc(struct mddev *mddev, struct bio *bi);
 extern void md_write_end(struct mddev *mddev);
 extern void md_done_sync(struct mddev *mddev, int blocks, int ok);
+void _md_error(struct mddev *mddev, struct md_rdev *rdev);
 extern void md_error(struct mddev *mddev, struct md_rdev *rdev);
+extern bool md_bio_failure_error(struct mddev *mddev, struct md_rdev *rdev, struct bio *bio);
 extern void md_finish_reshape(struct mddev *mddev);
 void md_submit_discard_bio(struct mddev *mddev, struct md_rdev *rdev,
 			struct bio *bio, sector_t start, sector_t size);

@@ -399,6 +399,11 @@ static void raid10_end_read_request(struct bio *bio)
 		 * wait for the 'master' bio.
 		 */
 		set_bit(R10BIO_Uptodate, &r10_bio->state);
+	} else if (test_bit(FailFast, &rdev->flags) &&
+		 test_bit(R10BIO_FailFast, &r10_bio->state)) {
+		/* This was a fail-fast read so we definitely
+		 * want to retry */
+		;
 	} else if (!raid1_should_handle_error(bio)) {
 		uptodate = 1;
 	} else {
@@ -488,7 +493,7 @@ static void raid10_end_write_request(struct bio *bio)
 			dec_rdev = 0;
 			if (test_bit(FailFast, &rdev->flags) &&
 			    (bio->bi_opf & MD_FAILFAST)) {
-				md_error(rdev->mddev, rdev);
+				md_bio_failure_error(rdev->mddev, rdev, bio);
 			}
 
 			/*
@@ -1984,6 +1989,33 @@ static int enough(struct r10conf *conf, int ignore)
 }
 
 /**
+ * update_lastdev - Set or clear LastDev flag for all rdevs in array
+ * @conf: pointer to r10conf
+ *
+ * Sets LastDev if the device is In_sync and cannot be lost for the array.
+ * Otherwise, clear it.
+ *
+ * Caller must hold ->reconfig_mutex or ->device_lock.
+ */
+static void update_lastdev(struct r10conf *conf)
+{
+	int i;
+	int raid_disks = max(conf->geo.raid_disks, conf->prev.raid_disks);
+
+	for (i = 0; i < raid_disks; i++) {
+		struct md_rdev *rdev = conf->mirrors[i].rdev;
+
+		if (rdev) {
+			if (test_bit(In_sync, &rdev->flags) &&
+			    !enough(conf, i))
+				set_bit(LastDev, &rdev->flags);
+			else
+				clear_bit(LastDev, &rdev->flags);
+		}
+	}
+}
+
+/**
  * raid10_error() - RAID10 error handler.
  * @mddev: affected md device.
  * @rdev: member device to fail.
@@ -2007,25 +2039,32 @@ static void raid10_error(struct mddev *mddev, struct md_rdev *rdev)
 
 	if (test_bit(In_sync, &rdev->flags) && !enough(conf, rdev->raid_disk)) {
 		set_bit(MD_BROKEN, &mddev->flags);
+		pr_crit("md/raid10:%s: Disk failure on %pg, this is the last device.\n"
+			"md/raid10:%s: Cannot continue operation (%d/%d failed).\n",
+			mdname(mddev), rdev->bdev,
+			mdname(mddev), mddev->degraded + 1, conf->geo.raid_disks);
 
 		if (!mddev->fail_last_dev) {
 			spin_unlock_irqrestore(&conf->device_lock, flags);
 			return;
 		}
 	}
-	if (test_and_clear_bit(In_sync, &rdev->flags))
+	if (test_and_clear_bit(In_sync, &rdev->flags)) {
 		mddev->degraded++;
+		update_lastdev(conf);
+	}
 
 	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 	set_bit(Blocked, &rdev->flags);
 	set_bit(Faulty, &rdev->flags);
 	set_mask_bits(&mddev->sb_flags, 0,
 		      BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_PENDING));
+	if (enough(conf, -1))
+		pr_crit("md/raid10:%s: Disk failure on %pg, disabling device.\n"
+			"md/raid10:%s: Operation continuing on %d devices.\n",
+			mdname(mddev), rdev->bdev,
+			mdname(mddev), conf->geo.raid_disks - mddev->degraded);
 	spin_unlock_irqrestore(&conf->device_lock, flags);
-	pr_crit("md/raid10:%s: Disk failure on %pg, disabling device.\n"
-		"md/raid10:%s: Operation continuing on %d devices.\n",
-		mdname(mddev), rdev->bdev,
-		mdname(mddev), conf->geo.raid_disks - mddev->degraded);
 }
 
 static void print_conf(struct r10conf *conf)
@@ -2102,6 +2141,7 @@ static int raid10_spare_active(struct mddev *mddev)
 	}
 	spin_lock_irqsave(&conf->device_lock, flags);
 	mddev->degraded -= count;
+	update_lastdev(conf);
 	spin_unlock_irqrestore(&conf->device_lock, flags);
 
 	print_conf(conf);
@@ -2413,7 +2453,7 @@ static void sync_request_write(struct mddev *mddev, struct r10bio *r10_bio)
 				continue;
 		} else if (test_bit(FailFast, &rdev->flags)) {
 			/* Just give up on this device */
-			md_error(rdev->mddev, rdev);
+			md_bio_failure_error(rdev->mddev, rdev, tbio);
 			continue;
 		}
 		/* Ok, we need to write this bio, either to correct an
@@ -2782,7 +2822,22 @@ static void fix_read_error(struct r10conf *conf, struct mddev *mddev, struct r10
 	}
 }
 
-static bool narrow_write_error(struct r10bio *r10_bio, int i)
+/**
+ * narrow_write_error() - Retry write and set badblock
+ * @r10_bio:	the r10bio containing the write error
+ * @i:		which device to retry
+ * @force:	Retry writing even if badblock is disabled
+ *
+ * Rewrites the bio, splitting it at the least common multiple of the logical
+ * block size and the badblock size. Blocks that fail to be written are marked
+ * as bad. If bbl disabled and @force is not set, no retry is attempted.
+ *
+ * Return:
+ * * %true	- all blocks were written or marked bad successfully
+ * * %false	- bbl disabled or
+ *		  one or more blocks write failed and could not be marked bad
+ */
+static bool narrow_write_error(struct r10bio *r10_bio, int i, bool force)
 {
 	struct bio *bio = r10_bio->master_bio;
 	struct mddev *mddev = r10_bio->mddev;
@@ -2803,13 +2858,17 @@ static bool narrow_write_error(struct r10bio *r10_bio, int i)
 	sector_t sector;
 	int sectors;
 	int sect_to_write = r10_bio->sectors;
-	bool ok = true;
+	bool write_ok = true;
+	bool setbad_ok = true;
+	bool bbl_enabled = !(rdev->badblocks.shift < 0);
 
-	if (rdev->badblocks.shift < 0)
+	if (!force && !bbl_enabled)
 		return false;
 
-	block_sectors = roundup(1 << rdev->badblocks.shift,
-				bdev_logical_block_size(rdev->bdev) >> 9);
+	block_sectors = bdev_logical_block_size(rdev->bdev) >> 9;
+	if (bbl_enabled)
+		block_sectors = roundup(1 << rdev->badblocks.shift,
+					block_sectors);
 	sector = r10_bio->sector;
 	sectors = ((r10_bio->sector + block_sectors)
 		   & ~(sector_t)(block_sectors - 1))
@@ -2829,18 +2888,22 @@ static bool narrow_write_error(struct r10bio *r10_bio, int i)
 				   choose_data_offset(r10_bio, rdev);
 		wbio->bi_opf = REQ_OP_WRITE;
 
-		if (submit_bio_wait(wbio) < 0)
+		if (submit_bio_wait(wbio) < 0) {
 			/* Failure! */
-			ok = rdev_set_badblocks(rdev, wsector,
-						sectors, 0)
-				&& ok;
+			write_ok = false;
+			if (bbl_enabled)
+				setbad_ok = rdev_set_badblocks(rdev, wsector,
+							       sectors, 0)
+					    && setbad_ok;
+		}
 
 		bio_put(wbio);
 		sect_to_write -= sectors;
 		sector += sectors;
 		sectors = block_sectors;
 	}
-	return ok;
+	return (write_ok ||
+		(bbl_enabled && setbad_ok));
 }
 
 static void handle_read_error(struct mddev *mddev, struct r10bio *r10_bio)
@@ -2868,8 +2931,9 @@ static void handle_read_error(struct mddev *mddev, struct r10bio *r10_bio)
 		freeze_array(conf, 1);
 		fix_read_error(conf, mddev, r10_bio);
 		unfreeze_array(conf);
-	} else
-		md_error(mddev, rdev);
+	} else {
+		md_bio_failure_error(mddev, rdev, bio);
+	}
 
 	rdev_dec_pending(rdev, mddev);
 	r10_bio->state = 0;
@@ -2945,8 +3009,17 @@ static void handle_write_completed(struct r10conf *conf, struct r10bio *r10_bio)
 				rdev_dec_pending(rdev, conf->mddev);
 			} else if (bio != NULL && bio->bi_status) {
 				fail = true;
-				if (!narrow_write_error(r10_bio, m))
+				if (!narrow_write_error(
+						r10_bio, m,
+						test_bit(FailFast, &rdev->flags) &&
+						(bio->bi_opf & MD_FAILFAST)))
 					md_error(conf->mddev, rdev);
+				else if (test_bit(In_sync, &rdev->flags) &&
+					 !test_bit(Faulty, &rdev->flags) &&
+					 rdev_has_badblock(rdev,
+							   r10_bio->devs[m].addr,
+							   r10_bio->sectors) == 0)
+					set_bit(R10BIO_Uptodate, &r10_bio->state);
 				rdev_dec_pending(rdev, conf->mddev);
 			}
 			bio = r10_bio->devs[m].repl_bio;
@@ -4161,6 +4234,7 @@ static int raid10_run(struct mddev *mddev)
 	md_set_array_sectors(mddev, size);
 	mddev->resync_max_sectors = size;
 	set_bit(MD_FAILFAST_SUPPORTED, &mddev->flags);
+	update_lastdev(conf);
 
 	if (md_integrity_register(mddev))
 		goto out_free_conf;
@@ -4569,6 +4643,7 @@ out:
 	 */
 	spin_lock_irq(&conf->device_lock);
 	mddev->degraded = calc_degraded(conf);
+	update_lastdev(conf);
 	spin_unlock_irq(&conf->device_lock);
 	mddev->raid_disks = conf->geo.raid_disks;
 	mddev->reshape_position = conf->reshape_progress;
